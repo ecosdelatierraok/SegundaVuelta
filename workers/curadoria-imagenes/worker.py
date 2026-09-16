@@ -1,4 +1,5 @@
 import io
+import math
 import os
 import signal
 import socket
@@ -9,7 +10,7 @@ from pathlib import Path
 from threading import Event
 
 from dotenv import load_dotenv
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from rembg import remove, new_session
 from supabase import create_client
 
@@ -148,13 +149,18 @@ def booleano_entorno(
 
 TAMANIO_FINAL = 1200
 MARGEN = 110
-CALIDAD_WEBP = 90
+CALIDAD_WEBP = 92
+CALIDAD_WEBP_DOCUMENTAL = 96
 MODELO = "u2net"
 
 UMBRAL_ALPHA = 8
 PADDING_RELATIVO = 0.05
 PADDING_MINIMO = 18
 MAX_LADO_UTIL = TAMANIO_FINAL - (MARGEN * 2)
+
+ANGULO_MAXIMO_ENDEREZADO_OBJETO = 8.0
+ANGULO_MAXIMO_ENDEREZADO_TEXTO = 7.0
+MEJORA_MINIMA_ENDEREZADO_TEXTO = 1.06
 
 BATCH_SIZE = entero_entorno(
     "SV_IMAGE_BATCH_SIZE",
@@ -409,6 +415,437 @@ def expandir_caja(
     )
 
 
+def reducir_para_analisis(
+    imagen,
+    lado=700,
+):
+    copia = imagen.copy()
+
+    copia.thumbnail(
+        (
+            lado,
+            lado,
+        ),
+        Image.Resampling.LANCZOS,
+    )
+
+    return copia
+
+
+def medir_imagen_documental(
+    imagen_rgb,
+):
+    analisis = reducir_para_analisis(
+        imagen_rgb.convert(
+            "RGB"
+        ),
+        lado=700,
+    )
+
+    gris = ImageOps.grayscale(
+        analisis
+    )
+
+    gris = ImageOps.autocontrast(
+        gris,
+        cutoff=0.5,
+    )
+
+    pixeles = list(
+        gris.getdata()
+    )
+
+    total = max(
+        1,
+        len(
+            pixeles
+        ),
+    )
+
+    claros = sum(
+        1
+        for valor in pixeles
+        if valor >= 205
+    )
+
+    ratio_claro = (
+        claros / total
+    )
+
+    bordes = gris.filter(
+        ImageFilter.FIND_EDGES
+    )
+
+    bordes = ImageOps.autocontrast(
+        bordes
+    )
+
+    pixeles_borde = list(
+        bordes.getdata()
+    )
+
+    fuertes = sum(
+        1
+        for valor in pixeles_borde
+        if valor >= 42
+    )
+
+    ratio_borde = (
+        fuertes /
+        max(
+            1,
+            len(
+                pixeles_borde
+            ),
+        )
+    )
+
+    return {
+        "ratio_claro":
+            ratio_claro,
+
+        "ratio_borde":
+            ratio_borde,
+    }
+
+
+def parece_foto_documental(
+    imagen_rgb,
+):
+    metricas = (
+        medir_imagen_documental(
+            imagen_rgb
+        )
+    )
+
+    ratio_claro = (
+        metricas[
+            "ratio_claro"
+        ]
+    )
+
+    ratio_borde = (
+        metricas[
+            "ratio_borde"
+        ]
+    )
+
+    es_documental = (
+        (
+            ratio_claro >=
+            0.58
+            and
+            ratio_borde >=
+            0.028
+        )
+        or
+        (
+            ratio_claro >=
+            0.72
+            and
+            ratio_borde >=
+            0.018
+        )
+    )
+
+    return (
+        es_documental,
+        metricas,
+    )
+
+
+def puntaje_alineacion_texto(
+    imagen_rgb,
+    angulo,
+):
+    analisis = reducir_para_analisis(
+        imagen_rgb.convert(
+            "RGB"
+        ),
+        lado=520,
+    )
+
+    gris = ImageOps.grayscale(
+        analisis
+    )
+
+    gris = ImageOps.autocontrast(
+        gris,
+        cutoff=0.5,
+    )
+
+    bordes = gris.filter(
+        ImageFilter.FIND_EDGES
+    )
+
+    bordes = ImageOps.autocontrast(
+        bordes
+    )
+
+    mascara = bordes.point(
+        lambda valor:
+            255
+            if valor >= 48
+            else 0
+    )
+
+    if abs(
+        angulo
+    ) > 0.001:
+        mascara = mascara.rotate(
+            angulo,
+            resample=
+                Image.Resampling.BICUBIC,
+            expand=False,
+            fillcolor=0,
+        )
+
+    ancho, alto = mascara.size
+
+    datos = mascara.load()
+
+    sumas = []
+
+    for y in range(
+        alto
+    ):
+        total_fila = 0
+
+        for x in range(
+            ancho
+        ):
+            if (
+                datos[
+                    x,
+                    y
+                ] >
+                0
+            ):
+                total_fila += 1
+
+        sumas.append(
+            total_fila
+        )
+
+    if (
+        len(
+            sumas
+        ) <
+        3
+    ):
+        return 0.0
+
+    media = (
+        sum(
+            sumas
+        ) /
+        len(
+            sumas
+        )
+    )
+
+    varianza = (
+        sum(
+            (
+                valor -
+                media
+            ) ** 2
+            for valor in sumas
+        ) /
+        len(
+            sumas
+        )
+    )
+
+    cambios = sum(
+        abs(
+            sumas[
+                indice
+            ] -
+            sumas[
+                indice - 1
+            ]
+        )
+        for indice in range(
+            1,
+            len(
+                sumas
+            )
+        )
+    )
+
+    return (
+        varianza
+        +
+        cambios * 0.35
+    )
+
+
+def enderezar_documento(
+    imagen_rgb,
+):
+    puntaje_cero = (
+        puntaje_alineacion_texto(
+            imagen_rgb,
+            0.0,
+        )
+    )
+
+    mejor_angulo = 0.0
+    mejor_puntaje = (
+        puntaje_cero
+    )
+
+    angulo = (
+        -ANGULO_MAXIMO_ENDEREZADO_TEXTO
+    )
+
+    while (
+        angulo <=
+        ANGULO_MAXIMO_ENDEREZADO_TEXTO
+        + 0.001
+    ):
+        if abs(
+            angulo
+        ) >= 0.75:
+            puntaje = (
+                puntaje_alineacion_texto(
+                    imagen_rgb,
+                    angulo,
+                )
+            )
+
+            if (
+                puntaje >
+                mejor_puntaje
+            ):
+                mejor_puntaje = (
+                    puntaje
+                )
+
+                mejor_angulo = (
+                    angulo
+                )
+
+        angulo += 0.5
+
+    if (
+        abs(
+            mejor_angulo
+        ) <
+        0.75
+    ):
+        return (
+            imagen_rgb,
+            0.0,
+        )
+
+    mejora = (
+        mejor_puntaje /
+        max(
+            1.0,
+            puntaje_cero,
+        )
+    )
+
+    if (
+        mejora <
+        MEJORA_MINIMA_ENDEREZADO_TEXTO
+    ):
+        return (
+            imagen_rgb,
+            0.0,
+        )
+
+    enderezada = (
+        imagen_rgb.rotate(
+            mejor_angulo,
+            resample=
+                Image.Resampling.BICUBIC,
+            expand=True,
+            fillcolor="white",
+        )
+    )
+
+    return (
+        enderezada,
+        mejor_angulo,
+    )
+
+
+def crear_foto_documental(
+    datos_entrada,
+):
+    imagen = abrir_imagen_desde_bytes(
+        datos_entrada,
+        modo="RGB",
+    )
+
+    imagen, angulo = (
+        enderezar_documento(
+            imagen
+        )
+    )
+
+    imagen = (
+        ImageEnhance.Contrast(
+            imagen
+        )
+        .enhance(
+            1.035
+        )
+    )
+
+    imagen = (
+        ImageEnhance.Sharpness(
+            imagen
+        )
+        .enhance(
+            1.28
+        )
+    )
+
+    imagen.thumbnail(
+        (
+            MAX_LADO_UTIL,
+            MAX_LADO_UTIL,
+        ),
+        Image.Resampling.LANCZOS,
+    )
+
+    lienzo = Image.new(
+        "RGB",
+        (
+            TAMANIO_FINAL,
+            TAMANIO_FINAL,
+        ),
+        "white",
+    )
+
+    x = (
+        TAMANIO_FINAL
+        - imagen.width
+    ) // 2
+
+    y = (
+        TAMANIO_FINAL
+        - imagen.height
+    ) // 2
+
+    lienzo.paste(
+        imagen,
+        (
+            x,
+            y,
+        ),
+    )
+
+    return (
+        lienzo,
+        angulo,
+    )
+
+
 def preparar_objeto_sin_fondo(
     datos_entrada,
 ):
@@ -426,7 +863,8 @@ def preparar_objeto_sin_fondo(
 
     datos_salida = remove(
         buffer_entrada.getvalue(),
-        session=obtener_sesion_modelo(),
+        session=
+            obtener_sesion_modelo(),
         alpha_matting=True,
         alpha_matting_foreground_threshold=240,
         alpha_matting_background_threshold=10,
@@ -451,13 +889,303 @@ def preparar_objeto_sin_fondo(
     return imagen
 
 
-def componer_objeto_en_blanco(
+def estimar_correccion_objeto(
+    alfa,
+):
+    mascara = alfa.resize(
+        (
+            256,
+            256,
+        ),
+        Image.Resampling.BILINEAR,
+    )
+
+    datos = mascara.load()
+
+    puntos = []
+
+    for y in range(
+        256
+    ):
+        for x in range(
+            256
+        ):
+            peso = (
+                datos[
+                    x,
+                    y
+                ]
+            )
+
+            if (
+                peso >=
+                96
+            ):
+                puntos.append(
+                    (
+                        float(
+                            x
+                        ),
+                        float(
+                            y
+                        ),
+                    )
+                )
+
+    cantidad = len(
+        puntos
+    )
+
+    if (
+        cantidad <
+        250
+    ):
+        return 0.0
+
+    media_x = (
+        sum(
+            punto[
+                0
+            ]
+            for punto in puntos
+        ) /
+        cantidad
+    )
+
+    media_y = (
+        sum(
+            punto[
+                1
+            ]
+            for punto in puntos
+        ) /
+        cantidad
+    )
+
+    cov_xx = (
+        sum(
+            (
+                punto[
+                    0
+                ] -
+                media_x
+            ) ** 2
+            for punto in puntos
+        ) /
+        cantidad
+    )
+
+    cov_yy = (
+        sum(
+            (
+                punto[
+                    1
+                ] -
+                media_y
+            ) ** 2
+            for punto in puntos
+        ) /
+        cantidad
+    )
+
+    cov_xy = (
+        sum(
+            (
+                punto[
+                    0
+                ] -
+                media_x
+            )
+            *
+            (
+                punto[
+                    1
+                ] -
+                media_y
+            )
+            for punto in puntos
+        ) /
+        cantidad
+    )
+
+    traza = (
+        cov_xx +
+        cov_yy
+    )
+
+    discriminante = max(
+        0.0,
+        (
+            (
+                cov_xx -
+                cov_yy
+            ) ** 2
+            +
+            4.0 *
+            cov_xy *
+            cov_xy
+        ),
+    )
+
+    raiz = math.sqrt(
+        discriminante
+    )
+
+    lambda_mayor = (
+        (
+            traza +
+            raiz
+        ) /
+        2.0
+    )
+
+    lambda_menor = (
+        (
+            traza -
+            raiz
+        ) /
+        2.0
+    )
+
+    if (
+        lambda_menor <=
+        0.0001
+    ):
+        relacion = 99.0
+    else:
+        relacion = math.sqrt(
+            lambda_mayor /
+            lambda_menor
+        )
+
+    if (
+        relacion <
+        1.18
+    ):
+        return 0.0
+
+    angulo = math.degrees(
+        0.5 *
+        math.atan2(
+            2.0 *
+            cov_xy,
+            cov_xx -
+            cov_yy,
+        )
+    )
+
+    while (
+        angulo >=
+        90.0
+    ):
+        angulo -= 180.0
+
+    while (
+        angulo <
+        -90.0
+    ):
+        angulo += 180.0
+
+    if (
+        abs(
+            angulo
+        ) <=
+        45.0
+    ):
+        correccion = (
+            -angulo
+        )
+    else:
+        eje = (
+            90.0
+            if angulo >
+            0
+            else -90.0
+        )
+
+        correccion = (
+            eje -
+            angulo
+        )
+
+    if (
+        abs(
+            correccion
+        ) <
+        0.85
+        or
+        abs(
+            correccion
+        ) >
+        ANGULO_MAXIMO_ENDEREZADO_OBJETO
+    ):
+        return 0.0
+
+    return (
+        correccion
+    )
+
+
+def enderezar_objeto_extraido(
     imagen,
 ):
     alfa = limpiar_canal_alpha(
         imagen.getchannel(
             "A"
         )
+    )
+
+    correccion = (
+        estimar_correccion_objeto(
+            alfa
+        )
+    )
+
+    if abs(
+        correccion
+    ) < 0.001:
+        return (
+            imagen,
+            0.0,
+        )
+
+    rotada = imagen.rotate(
+        correccion,
+        resample=
+            Image.Resampling.BICUBIC,
+        expand=True,
+        fillcolor=
+            (
+                0,
+                0,
+                0,
+                0,
+            ),
+    )
+
+    return (
+        rotada,
+        correccion,
+    )
+
+
+def componer_objeto_en_blanco(
+    imagen,
+):
+    imagen, correccion = (
+        enderezar_objeto_extraido(
+            imagen
+        )
+    )
+
+    alfa = limpiar_canal_alpha(
+        imagen.getchannel(
+            "A"
+        )
+    )
+
+    imagen.putalpha(
+        alfa
     )
 
     caja_objeto = alfa.getbbox()
@@ -514,11 +1242,27 @@ def componer_objeto_en_blanco(
         Image.Resampling.LANCZOS,
     )
 
-    objeto = objeto.filter(
-        ImageFilter.UnsharpMask(
-            radius=1.3,
-            percent=130,
-            threshold=2,
+    objeto_rgb = Image.new(
+        "RGB",
+        objeto.size,
+        "white",
+    )
+
+    objeto_rgb.paste(
+        objeto,
+        (
+            0,
+            0,
+        ),
+        objeto,
+    )
+
+    objeto_rgb = (
+        ImageEnhance.Sharpness(
+            objeto_rgb
+        )
+        .enhance(
+            1.16
         )
     )
 
@@ -542,12 +1286,118 @@ def componer_objeto_en_blanco(
     ) // 2
 
     lienzo.paste(
-        objeto,
-        (x, y),
-        objeto,
+        objeto_rgb,
+        (
+            x,
+            y,
+        ),
     )
 
-    return lienzo
+    return (
+        lienzo,
+        correccion,
+    )
+
+
+def ratio_area_alpha(
+    imagen_rgba,
+):
+    alfa = limpiar_canal_alpha(
+        imagen_rgba.getchannel(
+            "A"
+        )
+    )
+
+    caja = alfa.getbbox()
+
+    if caja is None:
+        return 0.0
+
+    x1, y1, x2, y2 = caja
+
+    area_caja = max(
+        1,
+        (
+            x2 -
+            x1
+        )
+        *
+        (
+            y2 -
+            y1
+        ),
+    )
+
+    area_total = max(
+        1,
+        imagen_rgba.width *
+        imagen_rgba.height,
+    )
+
+    return (
+        area_caja /
+        area_total
+    )
+
+
+def decidir_modo_documental(
+    datos_entrada,
+    imagen_extraida=None,
+):
+    original = abrir_imagen_desde_bytes(
+        datos_entrada,
+        modo="RGB",
+    )
+
+    documental_directo, metricas = (
+        parece_foto_documental(
+            original
+        )
+    )
+
+    if documental_directo:
+        return (
+            True,
+            metricas,
+            None,
+        )
+
+    ratio_alpha = None
+
+    if (
+        imagen_extraida is not None
+    ):
+        ratio_alpha = (
+            ratio_area_alpha(
+                imagen_extraida
+            )
+        )
+
+        if (
+            metricas[
+                "ratio_claro"
+            ] >=
+            0.46
+            and
+            metricas[
+                "ratio_borde"
+            ] >=
+            0.018
+            and
+            ratio_alpha <=
+            0.34
+        ):
+            return (
+                True,
+                metricas,
+                ratio_alpha,
+            )
+
+    return (
+        False,
+        metricas,
+        ratio_alpha,
+    )
 
 
 def crear_fallback_seguro(
@@ -566,11 +1416,12 @@ def crear_fallback_seguro(
         Image.Resampling.LANCZOS,
     )
 
-    imagen = imagen.filter(
-        ImageFilter.UnsharpMask(
-            radius=1.2,
-            percent=120,
-            threshold=2,
+    imagen = (
+        ImageEnhance.Sharpness(
+            imagen
+        )
+        .enhance(
+            1.16
         )
     )
 
@@ -595,7 +1446,10 @@ def crear_fallback_seguro(
 
     lienzo.paste(
         imagen,
-        (x, y),
+        (
+            x,
+            y,
+        ),
     )
 
     return lienzo
@@ -603,13 +1457,18 @@ def crear_fallback_seguro(
 
 def imagen_a_webp(
     imagen,
+    calidad=
+        CALIDAD_WEBP,
 ):
     salida = io.BytesIO()
 
     imagen.save(
         salida,
         format="WEBP",
-        quality=CALIDAD_WEBP,
+        quality=
+            int(
+                calidad
+            ),
         method=6,
     )
 
@@ -620,18 +1479,103 @@ def procesar_imagen(
     datos_entrada,
 ):
     try:
-        final = (
-            componer_objeto_en_blanco(
-                preparar_objeto_sin_fondo(
+        original = (
+            abrir_imagen_desde_bytes(
+                datos_entrada,
+                modo="RGB",
+            )
+        )
+
+        documental_directo, metricas = (
+            parece_foto_documental(
+                original
+            )
+        )
+
+        if documental_directo:
+            final, angulo = (
+                crear_foto_documental(
                     datos_entrada
                 )
             )
+
+            print(
+                f"[{WORKER_ID}] "
+                "Modo DOCUMENTAL directo "
+                f"claro={metricas['ratio_claro']:.3f} "
+                f"bordes={metricas['ratio_borde']:.3f} "
+                f"angulo={angulo:.2f}"
+            )
+
+            return {
+                "datos":
+                    imagen_a_webp(
+                        final,
+                        CALIDAD_WEBP_DOCUMENTAL,
+                    ),
+
+                "modo":
+                    "DOCUMENTAL",
+            }
+
+        extraida = (
+            preparar_objeto_sin_fondo(
+                datos_entrada
+            )
+        )
+
+        es_documental, metricas, ratio_alpha = (
+            decidir_modo_documental(
+                datos_entrada,
+                imagen_extraida=
+                    extraida,
+            )
+        )
+
+        if es_documental:
+            final, angulo = (
+                crear_foto_documental(
+                    datos_entrada
+                )
+            )
+
+            print(
+                f"[{WORKER_ID}] "
+                "Modo DOCUMENTAL por contexto "
+                f"claro={metricas['ratio_claro']:.3f} "
+                f"bordes={metricas['ratio_borde']:.3f} "
+                f"alpha={ratio_alpha} "
+                f"angulo={angulo:.2f}"
+            )
+
+            return {
+                "datos":
+                    imagen_a_webp(
+                        final,
+                        CALIDAD_WEBP_DOCUMENTAL,
+                    ),
+
+                "modo":
+                    "DOCUMENTAL",
+            }
+
+        final, correccion = (
+            componer_objeto_en_blanco(
+                extraida
+            )
+        )
+
+        print(
+            f"[{WORKER_ID}] "
+            "Modo CURADA "
+            f"correccion={correccion:.2f}"
         )
 
         return {
             "datos":
                 imagen_a_webp(
-                    final
+                    final,
+                    CALIDAD_WEBP,
                 ),
 
             "modo":
@@ -655,7 +1599,8 @@ def procesar_imagen(
         return {
             "datos":
                 imagen_a_webp(
-                    final
+                    final,
+                    CALIDAD_WEBP,
                 ),
 
             "modo":
